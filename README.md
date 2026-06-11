@@ -8,6 +8,20 @@
 
 ---
 
+## 视频演示
+
+项目完整功能演示视频（Streamlit UI 上传 PDF、Agent 问答、Debug Trace、PostgreSQL 历史记录等）可通过百度网盘观看：
+
+| 项 | 内容 |
+|----|------|
+| 文件 | `rag-demo.mp4` |
+| 链接 | https://pan.baidu.com/s/10rnIBdjZvJ4yV4H40-k9Sg |
+| 提取码 | `mbdk` |
+
+> 上述链接为**视频演示**，展示 rag-agent 端到端使用流程。如需自行录屏或逐步操作，可参考 [docs/ui_demo_guide.md](docs/ui_demo_guide.md)。
+
+---
+
 ## 核心功能
 
 | 功能 | 说明 |
@@ -382,6 +396,7 @@ rag-agent/
 │   └── out/                     # 评估报告输出
 ├── scripts/
 │   ├── smoke_test.sh            # 端到端冒烟测试
+│   ├── final_demo_check.sh      # 最终交付检查
 │   └── check_env.sh             # 环境变量检查
 └── docs/
     ├── architecture.md          # 详细架构说明
