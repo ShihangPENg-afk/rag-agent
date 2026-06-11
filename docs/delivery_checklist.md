@@ -1,7 +1,7 @@
 # rag-agent 交付清单
 
-> 最后核对：2026-06-10  
-> 关联文档：[final_report.md](final_report.md) · [README.md](../README.md)
+> 最后核对：2026-06-11  
+> 关联文档：[final_report.md](final_report.md) · [README.md](../README.md) · [ui_demo_guide.md](ui_demo_guide.md)
 
 ---
 
@@ -10,9 +10,11 @@
 | 类别 | 状态 |
 |------|------|
 | 核心功能 | 已完成 |
+| Streamlit UI | 已完成 |
+| PostgreSQL 混合持久化 | 已完成（元数据 + QA 日志；向量仍为 FAISS） |
 | 容器化与验收 | 已完成 |
 | 文档与配置模板 | 已完成 |
-| 生产化 / 扩展能力 | 未完成（见第 11 节） |
+| 生产化 / 扩展能力 | 未完成（见第 14 节） |
 
 ---
 
@@ -35,8 +37,10 @@ make install && make env-check && make run
 ## 2. Docker 运行
 
 - [x] `Dockerfile` 存在（`python:3.10-slim` + `libgomp1` + uvicorn）
-- [x] `docker-compose.yml` 存在（端口 `8000:8000`、`env_file`、healthcheck）
-- [x] `make docker-up` 可构建镜像并后台启动容器 `rag-agent`
+- [x] `docker-compose.yml` 存在（`rag-agent` + `postgres:16-alpine`）
+- [x] API 端口 `8000:8000`，PostgreSQL 端口 `5432:5432`
+- [x] `rag-agent` 通过 `DATABASE_URL` 连接 `postgres` 服务（`depends_on` + healthcheck）
+- [x] `make docker-up` 可构建镜像并后台启动容器
 - [x] `make docker-down` / `make docker-logs` 可用
 - [x] 容器 healthcheck 探测 `GET /health`
 
@@ -45,9 +49,10 @@ make install && make env-check && make run
 ```bash
 make env-check && make docker-up
 curl -fsS http://127.0.0.1:8000/health
+docker compose ps   # postgres 与 rag-agent 均为 healthy / running
 ```
 
-**已知约束：** 知识库在进程内存中，容器重启后需重新上传 PDF。
+**已知约束：** **FAISS 向量索引**在 API 进程内存中，容器重启后需重新上传 PDF 才能问答；**PostgreSQL** 中的 `documents` / `qa_logs` 记录会保留。
 
 ---
 
@@ -166,9 +171,11 @@ make eval-ragas RAGAS_LIMIT=3 RAGAS_METRICS=all RAGAS_TIMEOUT=600
 - [x] 含项目简介（Agentic RAG）
 - [x] 含核心功能、技术栈、架构概览
 - [x] 含本地启动、Docker 启动、Smoke Test 说明
-- [x] 含 API 示例（`/upload_pdf/`、`/ask/`、`/ask_rag/`）
+- [x] 含 **Streamlit UI** 启动方法（`ui/streamlit_app.py`）
+- [x] 含 **PostgreSQL 混合持久化**说明（向量 FAISS / 元数据与日志 PG）
+- [x] 含 API 示例（`/upload_pdf/`、`/ask/`、`/ask_rag/`、`/documents/`、`/qa_logs/`）
 - [x] 含 RAGAS Day 5 结果与报告路径
-- [x] 含与 `llm-finetune-manual` 的关系说明
+- [x] 含与 `llm-finetune-manual` 的关系说明（**未接入 LoRA**）
 - [x] 含当前限制与后续计划
 
 ---
@@ -178,7 +185,8 @@ make eval-ragas RAGAS_LIMIT=3 RAGAS_METRICS=all RAGAS_TIMEOUT=600
 - [x] `.env.example` 存在
 - [x] 仅含占位符 `your_dashscope_api_key_here`，无真实 Key
 - [x] 含 `DASHSCOPE_BASE_URL`、`MODEL_NAME` 示例
-- [x] `make env-init` 可在 `.env` 不存在时从模板复制
+- [x] 含 `POSTGRES_*`、`DATABASE_URL`（混合持久化，非向量存储）
+- [x] `make env-init` 可在 `.env` 不存在时从模板复制；已有 `.env` 可补全 PG 变量
 - [x] `.gitignore` 已忽略 `.env`
 
 **文件路径：** `.env.example`
@@ -197,16 +205,88 @@ make eval-ragas RAGAS_LIMIT=3 RAGAS_METRICS=all RAGAS_TIMEOUT=600
 
 ---
 
-## 11. 当前未完成项
+## 11. Streamlit UI
+
+- [x] `ui/streamlit_app.py` 存在，依赖 `ui/requirements-ui.txt`
+- [x] 侧边栏可配置 `API_BASE_URL`，检测 `/openapi.json` 连通性
+- [x] 支持 PDF 上传 → 调用 `POST /upload_pdf/` 构建 FAISS 向量库
+- [x] 「聊天」页多轮 Agent 问答，默认 `debug=true`，可展开 Debug Trace 四面板
+- [x] 侧边栏区分 **可用知识库**（内存 FAISS）与 **历史文档**（仅 PG 记录）
+- [x] 「历史记录」页调用 `GET /qa_logs/` 展示 PostgreSQL 持久化问答
+- [x] 「调试说明」页列出相关 API 与连接状态
+- [x] 录屏步骤文档：`docs/ui_demo_guide.md`
+
+**验收命令：**
+
+```bash
+# 终端 1
+make env-check && docker compose up postgres -d && make run
+
+# 终端 2
+source .venv/bin/activate
+pip install -r ui/requirements-ui.txt
+streamlit run ui/streamlit_app.py
+# 浏览器打开 http://127.0.0.1:8501
+```
+
+**手动验收：** 上传 `test.pdf` → 提问并展开 Debug → 「历史记录」可见 QA 日志 → 重启 `make run` 后历史仍在但需重新上传才可问答。
+
+---
+
+## 12. PostgreSQL 混合持久化
+
+> **边界：** 向量检索仍使用进程内 **FAISS**；PostgreSQL **仅**保存文档元信息与 QA 日志，**不存储向量或 chunk 正文**。
+
+- [x] `app/db/models.py`：`documents`、`qa_logs` 表定义
+- [x] `app/db/repository.py`：`record_document`、`record_qa_log`、`list_recent_documents`、`list_qa_logs_by_knowledge_base`
+- [x] 启动时 `create_tables()` 自动建表（DB 不可用时降级，不影响核心 RAG）
+- [x] 上传成功写入 `documents`（`upload_service` → `record_document`）
+- [x] `POST /ask/` 成功后写入 `qa_logs`（含可选 `debug` JSONB）
+- [x] `GET /documents/`、`GET /qa_logs/` API 可用
+- [x] `docker-compose.yml` 含 `postgres` 服务与 `postgres_data` 卷
+- [x] `.env.example` 含 `DATABASE_URL` 与 `POSTGRES_*` 变量
+
+**验收命令：**
+
+```bash
+docker compose up postgres -d
+make run   # 另终端
+
+# 上传并问答（可用 make smoke 或 UI）
+make smoke
+
+# 查询 PG 元数据与日志
+curl -fsS "http://127.0.0.1:8000/documents/?limit=5"
+curl -fsS "http://127.0.0.1:8000/qa_logs/?knowledge_base_id=<KB_ID>&limit=5"
+
+# 对比：内存中可问答知识库（FAISS）
+curl -fsS http://127.0.0.1:8000/knowledge_bases
+```
+
+**重启验证：** 停止并重启 API 后，`/knowledge_bases` 为空或不含旧 ID，但 `/documents/` 与 `/qa_logs/` 仍可返回历史记录。
+
+---
+
+## 13. UI 录屏演示文档
+
+- [x] `docs/ui_demo_guide.md` 已创建
+- [x] 含录屏前环境准备与服务启动步骤
+- [x] 含分步演示脚本（上传、问答、Debug、历史、可选重启对比）
+- [x] 明确 FAISS / PostgreSQL 职责边界
+- [x] 未声称 LoRA 已接入
+
+---
+
+## 14. 当前未完成项
 
 以下能力**不在本期交付范围内**，或仅有规划、尚未实现：
 
 ### 基础设施与持久化
 
-- [ ] 知识库持久化（FAISS 索引落盘或接入外部向量数据库）
-- [ ] 外部数据库（Redis / PostgreSQL 等）
-- [ ] 服务端跨会话 Memory 持久化
+- [ ] **FAISS / 向量持久化**（索引落盘或接入专用向量数据库；当前向量仅在内存）
+- [ ] 服务端跨会话 Memory 自动注入（当前依赖客户端 `history` + QA 日志查询）
 - [ ] 生产级鉴权、限流与访问控制
+- [ ] Redis 等缓存层
 
 ### 模型与评估
 
@@ -229,7 +309,7 @@ make eval-ragas RAGAS_LIMIT=3 RAGAS_METRICS=all RAGAS_TIMEOUT=600
 
 ## 签收参考
 
-全部 **第 1–10 节** 勾选项满足后，可认为 rag-agent **Day 6 核心交付完成**。第 11 节未完成项作为后续迭代 backlog，不影响当前 Agentic RAG 演示与验收结论。
+全部 **第 1–13 节** 勾选项满足后，可认为 rag-agent **最终交付完成**（含 Streamlit UI 与 PostgreSQL 混合持久化）。第 14 节未完成项作为后续迭代 backlog；**LoRA 微调模型本阶段未接入**，不影响当前验收结论。
 
 **推荐最终验收顺序：**
 
@@ -237,5 +317,10 @@ make eval-ragas RAGAS_LIMIT=3 RAGAS_METRICS=all RAGAS_TIMEOUT=600
 make env-check
 make docker-up
 make smoke
+curl -fsS "http://127.0.0.1:8000/documents/?limit=5"
 make eval-ragas RAGAS_LIMIT=3 RAGAS_METRICS=all RAGAS_TIMEOUT=600
+
+# UI 验收（另开终端）
+pip install -r ui/requirements-ui.txt && streamlit run ui/streamlit_app.py
+# 按 docs/ui_demo_guide.md 走一遍演示流程
 ```

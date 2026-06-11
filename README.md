@@ -18,7 +18,9 @@
 | **多步推理** | `planner` 拆解子问题，`evaluator` 汇总证据并决定是否继续检索 |
 | **对话 Memory** | 请求体传入 `history`，保留最近 3 轮；Agent 将历史摘要注入 system message，检索工具也可利用历史做指代消解 |
 | **Debug trace** | `/ask/` 设置 `debug: true`，返回 `tool_trace`、`reasoning_snapshot`、`retrieved_evidence_preview` |
-| **Docker 部署** | `Dockerfile` + `docker-compose.yml`，含 healthcheck |
+| **Streamlit UI** | 浏览器端上传 PDF、多轮问答、Debug Trace 可视化、历史问答查看 |
+| **PostgreSQL 混合持久化** | 文档元信息与 QA 日志落库；**向量检索仍用进程内 FAISS** |
+| **Docker 部署** | `Dockerfile` + `docker-compose.yml`（含 PostgreSQL），含 healthcheck |
 | **RAGAS 评估** | 离线脚本对 Agent 回答打分，输出 JSON / Markdown 报告 |
 
 **问答入口：**
@@ -33,10 +35,12 @@
 | 类别 | 技术 |
 |------|------|
 | Web 框架 | **FastAPI**、Uvicorn |
+| 前端 UI | **Streamlit**（`ui/streamlit_app.py`，调用后端 HTTP API） |
 | Agent 编排 | **LangGraph**、LangChain OpenAI 兼容接口 |
-| 向量检索 | **FAISS**、NumPy |
+| 向量检索 | **FAISS**、NumPy（进程内，**不写入 PostgreSQL**） |
+| 元数据 / 日志 | **PostgreSQL 16**、SQLAlchemy（`documents`、`qa_logs` 表） |
 | 大模型 / 向量 | **DashScope**（`qwen-plus`、TextEmbedding），通过 **OpenAI-compatible API** 调用 |
-| 容器化 | **Docker**、**Docker Compose** |
+| 容器化 | **Docker**、**Docker Compose**（`rag-agent` + `postgres`） |
 | 质量评估 | **RAGAS**（`Faithfulness`、`ResponseRelevancy`） |
 | 文本处理 | pypdf、langchain-text-splitters |
 
@@ -45,18 +49,24 @@
 ## 架构概览
 
 ```
-上传 PDF → 切块 / 向量化 → FAISS 索引（进程内知识库）
+上传 PDF → 切块 / 向量化 → FAISS 索引（进程内，可问答）
+              │                    ↓
+              │          POST /ask/（Agent，默认）
+              │                    ↓
+              │   planner → agent ⇄ tools → evaluator → answer
+              │                    ↓
+              │    retrieve_chunks / list_headings / count_tables
+              ↓
+     PostgreSQL documents 表（元信息：文件名、块数、状态）
                               ↓
-                    POST /ask/（Agent，默认）
-                              ↓
-         planner → agent ⇄ tools → evaluator → answer
-                              ↓
-              retrieve_chunks / list_headings / count_tables
+                    qa_logs 表（问答历史 + 可选 debug JSON）
 
                     POST /ask_rag/（经典 RAG，回退）
                               ↓
          历史增强 → FAISS 检索 → Prompt → DashScope 生成
 ```
+
+**混合持久化说明：** 向量索引与 chunk 文本保存在**进程内存**（FAISS + `kb_registry`）；PostgreSQL **仅**持久化上传文档的元信息（`documents`）与 Agent 问答日志（`qa_logs`）。服务重启后，数据库中的历史记录仍可查询，但 FAISS 索引会丢失，需重新上传 PDF 才能继续问答。详见 [docs/architecture.md](docs/architecture.md)。
 
 ---
 
@@ -86,9 +96,26 @@ make env-check   # 检查 DASHSCOPE_API_KEY 是否已填入真实值
 ```env
 DASHSCOPE_API_KEY=你的_API_Key
 DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1   # 可选
+
+# PostgreSQL（文档元信息 / QA 日志；向量仍走 FAISS）
+POSTGRES_USER=ragagent
+POSTGRES_PASSWORD=ragagent_secret
+POSTGRES_DB=ragagent
+DATABASE_URL=postgresql+psycopg2://ragagent:ragagent_secret@localhost:5432/ragagent
 ```
 
-> 不要使用 `cp .env.example .env` 覆盖已有 `.env`，否则会把真实 API Key 替换成占位符。
+> 不要使用 `cp .env.example .env` 覆盖已有 `.env`，否则会把真实 API Key 替换成占位符。  
+> 若已有 `.env` 但缺少 PostgreSQL 变量，可执行 `make env-init` 自动从 `.env.example` 补全。
+
+### 2.1 启动 PostgreSQL（混合持久化）
+
+PostgreSQL 只存元数据与 QA 日志，**不参与向量检索**。本地开发可先单独启动数据库容器：
+
+```bash
+docker compose up postgres -d
+```
+
+或使用 `make docker-up` 同时启动 PostgreSQL 与 API 服务（见下文 Docker 启动）。
 
 ### 3. 本地启动
 
@@ -99,7 +126,36 @@ make run
 
 服务默认监听 `http://127.0.0.1:8000`，交互式 API 文档：`http://127.0.0.1:8000/docs`。
 
-### 4. Docker 启动
+启动时会尝试连接 PostgreSQL 并自动建表；数据库暂不可用时，核心 RAG 功能仍可运行，但元数据与 QA 日志不会落库。
+
+### 4. Streamlit UI 启动
+
+UI 为独立前端，通过 HTTP 调用 FastAPI 后端，不直接访问 FAISS 或 PostgreSQL。
+
+**终端 1 — 启动后端**（需 PostgreSQL 已就绪，见 2.1）：
+
+```bash
+make env-check && make run
+```
+
+**终端 2 — 启动 Streamlit**：
+
+```bash
+source .venv/bin/activate
+pip install -r ui/requirements-ui.txt
+streamlit run ui/streamlit_app.py
+```
+
+浏览器默认打开 `http://127.0.0.1:8501`。侧边栏可配置 `API_BASE_URL`（默认 `http://127.0.0.1:8000`），也可通过环境变量覆盖：
+
+```bash
+export API_BASE_URL=http://127.0.0.1:8000
+streamlit run ui/streamlit_app.py
+```
+
+UI 主要能力：PDF 上传与向量库构建、多轮 Agent 问答、Debug Trace 可视化、「历史记录」页查看 PostgreSQL 中的 QA 日志。录屏演示步骤见 [docs/ui_demo_guide.md](docs/ui_demo_guide.md)。
+
+### 5. Docker 启动
 
 ```bash
 make env-init && make env-check
@@ -108,11 +164,13 @@ make docker-up          # 后台构建并启动
 docker compose up --build
 ```
 
-启动后访问 [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)。
+启动后访问 [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)。Compose 会同时拉起 `postgres`（端口 `5432`）与 `rag-agent`（端口 `8000`），并通过 `DATABASE_URL` 将 API 服务指向数据库容器。
 
-> 知识库保存在**进程内存**中，容器重启后需重新上传 PDF。
+> **FAISS 向量索引**仍在 API 进程内存中，容器重启后需重新上传 PDF 才能问答；**PostgreSQL** 中的文档元信息与 QA 日志会保留。
 
-### 5. Smoke Test
+Streamlit UI 需在宿主机单独启动（见上文第 4 节），默认连接 `http://127.0.0.1:8000`。
+
+### 6. Smoke Test
 
 服务启动后，在项目根目录运行端到端冒烟测试（4 步：文档可达 → 上传 PDF → 解析 `knowledge_base_id` → Agent 问答）：
 
@@ -205,9 +263,11 @@ curl -X POST "http://127.0.0.1:8000/ask_rag/" \
 |------|------|------|
 | `GET` | `/health` | 健康检查（网络、知识库数量） |
 | `POST` | `/upload_pdfs/` | 批量上传 PDF |
-| `GET` | `/knowledge_bases` | 列出所有知识库 |
-| `DELETE` | `/knowledge_base/{kb_id}` | 删除指定知识库 |
-| `DELETE` | `/clear_all_knowledge_bases` | 清空所有知识库 |
+| `GET` | `/knowledge_bases` | 列出当前内存中可问答的知识库（FAISS 已加载） |
+| `GET` | `/documents/` | 最近上传文档（PostgreSQL 元信息） |
+| `GET` | `/qa_logs/?knowledge_base_id=...` | 按知识库查询历史问答（PostgreSQL） |
+| `DELETE` | `/knowledge_base/{kb_id}` | 删除指定知识库（仅内存，不删 PG 记录） |
+| `DELETE` | `/clear_all_knowledge_bases` | 清空所有内存知识库 |
 
 ---
 
@@ -280,19 +340,19 @@ python evals/run_ragas_eval.py \
 
 ## 当前限制
 
-- **知识库为进程级注册**：FAISS 索引与 chunk 数据保存在内存中，服务或容器重启后需重新上传 PDF。
-- **未接入持久化数据库**：无 Redis / PostgreSQL / 向量数据库等外部存储。
-- **LoRA 微调模型尚未接入**：生成与评估均依赖 DashScope 在线 API，未加载本地微调权重。
+- **向量仍为进程内 FAISS**：FAISS 索引与 chunk 文本保存在内存中，服务或容器重启后需重新上传 PDF 才能问答；PostgreSQL **不**存储向量或 chunk 正文。
+- **PostgreSQL 仅混合持久化**：`documents` 表记录上传元信息，`qa_logs` 表记录 Agent 问答与 debug 快照；重启后可在 UI/API 查看历史，但无法仅凭数据库记录恢复检索能力。
+- **LoRA 微调模型尚未接入**：生成与评估均依赖 DashScope 在线 API（`qwen-plus`），未加载本地微调权重。
 - **faithfulness 评估较慢**：RAGAS `Faithfulness` 需额外 LLM 判分，多样本并发时易超时；脚本在 `metrics=faithfulness` 时会自动切换逐条串行模式。
 - **文档结构工具为启发式**：`list_headings`、`count_tables` 基于切块文本规则，不解析 PDF 原生目录或表格对象。
-- **Memory 为请求级**：多轮对话由客户端在 `history` 字段中传递，服务端不跨会话持久化用户记忆。
+- **Memory 为请求级**：多轮对话由客户端在 `history` 字段中传递；跨会话长期记忆依赖 QA 日志查询，非自动注入上下文。
 
 ---
 
 ## 后续计划
 
-- [ ] **持久化知识库** — 将 FAISS 索引与元数据落盘或接入向量数据库，支持重启恢复
-- [ ] **接入微调模型** — 将 llm-finetune-manual 产出的 LoRA 权重接入 Agent 生成节点，支持本地推理
+- [ ] **FAISS / 向量持久化** — 将 FAISS 索引落盘或接入专用向量数据库，支持重启后无需重新上传即可问答
+- [ ] **接入微调模型** — 将 llm-finetune-manual 产出的 LoRA 权重接入 Agent 生成节点（**当前阶段未接入**）
 - [ ] **增加评估样本** — 扩充 `evals/ragas_samples.json`，覆盖多跳推理与结构类问题
 - [ ] **增加 CI/CD** — 在流水线中自动运行 Smoke Test 与 RAGAS 基线对比
 
@@ -312,6 +372,10 @@ rag-agent/
 │   ├── services/                # 上传、索引、问答服务
 │   ├── tools/                   # Agent 工具
 │   └── vectordb/faiss_store.py  # FAISS 封装
+├── ui/
+│   ├── streamlit_app.py         # Streamlit 演示 UI
+│   └── requirements-ui.txt      # UI 独立依赖
+├── app/db/                      # PostgreSQL ORM 与 repository
 ├── evals/
 │   ├── run_ragas_eval.py        # RAGAS 评估脚本
 │   ├── ragas_samples.json       # 评估样本
@@ -319,21 +383,27 @@ rag-agent/
 ├── scripts/
 │   ├── smoke_test.sh            # 端到端冒烟测试
 │   └── check_env.sh             # 环境变量检查
-└── docs/architecture.md         # 详细架构说明
+└── docs/
+    ├── architecture.md          # 详细架构说明
+    ├── delivery_checklist.md    # 交付验收清单
+    └── ui_demo_guide.md         # UI 录屏演示步骤
 ```
 
 ## 常用命令
 
 ```bash
 make help             # 查看所有命令
-make run              # 本地启动
-make docker-up        # Docker 后台启动
+make run              # 本地启动 FastAPI
+make docker-up        # Docker 后台启动（API + PostgreSQL）
 make docker-down      # 停止容器
 make smoke            # 端到端冒烟测试
 make eval-ragas       # RAGAS 评估
 make test-agent       # Agent 本地测试
 make test-retrieval   # 检索工具测试
 make test-doc-tools   # 文档结构工具测试
+
+# Streamlit UI（另开终端）
+pip install -r ui/requirements-ui.txt && streamlit run ui/streamlit_app.py
 ```
 
 ## License
