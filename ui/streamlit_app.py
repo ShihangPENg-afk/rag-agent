@@ -89,6 +89,29 @@ def fetch_documents(api_base_url: str, limit: int = 50) -> list[dict]:
     return response.json().get("documents", [])
 
 
+def fetch_active_knowledge_base_ids(api_base_url: str) -> set[str]:
+    response = requests.get(
+        f"{api_base_url}/knowledge_bases",
+        timeout=LIST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    return {kb["id"] for kb in payload.get("knowledge_bases", [])}
+
+
+def _is_kb_active(kb_id: str | None, active_kb_ids: set[str]) -> bool:
+    return bool(kb_id and kb_id in active_kb_ids)
+
+
+def _clear_knowledge_base_session() -> None:
+    st.session_state.knowledge_base_id = None
+    st.session_state.upload_filename = None
+    st.session_state.chunks_count = None
+    st.session_state.upload_status = None
+    st.session_state.upload_message = None
+    st.session_state.history = []
+
+
 def fetch_qa_logs(
     api_base_url: str,
     knowledge_base_id: str,
@@ -316,87 +339,155 @@ def _format_request_error(exc: requests.RequestException) -> str:
     return f"上传时发生网络错误：{exc}"
 
 
-def _render_knowledge_base_status() -> None:
+def _render_knowledge_base_status(active_kb_ids: set[str]) -> None:
     st.subheader("当前知识库状态")
 
-    if st.session_state.knowledge_base_id:
+    kb_id = st.session_state.knowledge_base_id
+    kb_active = _is_kb_active(kb_id, active_kb_ids)
+
+    if kb_id:
+        if kb_active:
+            st.success("当前知识库已在后端内存中加载，可以问答。")
+        else:
+            st.error(
+                "当前知识库仅有数据库记录，向量索引未加载（常见于后端重启后）。"
+                "请在侧边栏重新上传 PDF，或从「可用知识库」中选择。"
+            )
+
         col1, col2 = st.columns(2)
         with col1:
             st.metric("文本块数量", st.session_state.chunks_count or 0)
         with col2:
-            st.metric("状态", st.session_state.upload_status or "unknown")
+            display_status = "ready" if kb_active else "需重新上传"
+            st.metric("问答状态", display_status)
 
-        st.markdown(f"**knowledge_base_id:** `{st.session_state.knowledge_base_id}`")
+        st.markdown(f"**knowledge_base_id:** `{kb_id}`")
         st.markdown(f"**filename:** `{st.session_state.upload_filename or '-'}`")
         st.markdown(f"**chunks_count:** `{st.session_state.chunks_count}`")
-        st.markdown(f"**status:** `{st.session_state.upload_status or '-'}`")
+        st.markdown(
+            f"**数据库 status:** `{st.session_state.upload_status or '-'}` "
+            f"（仅表示历史上传成功，不代表当前可问答）"
+        )
         if st.session_state.upload_message:
             st.markdown(f"**message:** {st.session_state.upload_message}")
     else:
-        st.info("尚未选择知识库。请在侧边栏上传 PDF 构建，或从最近文档中选择已有知识库。")
+        st.info("尚未选择可用知识库。请在侧边栏上传 PDF 构建，或从「可用知识库」中选择。")
 
 
-def _render_sidebar_documents(api_base_url: str, reachable: bool) -> None:
-    st.subheader("最近文档")
+def _load_sidebar_catalog(api_base_url: str, force_refresh: bool) -> tuple[list[dict], set[str]]:
+    documents: list[dict] = st.session_state.get("sidebar_documents", [])
+    active_kb_ids: set[str] = st.session_state.get("active_kb_ids", set())
+
+    if (
+        force_refresh
+        or "sidebar_documents" not in st.session_state
+        or "active_kb_ids" not in st.session_state
+    ):
+        documents = fetch_documents(api_base_url)
+        active_kb_ids = fetch_active_knowledge_base_ids(api_base_url)
+        st.session_state.sidebar_documents = documents
+        st.session_state.active_kb_ids = active_kb_ids
+
+    return documents, active_kb_ids
+
+
+def _render_sidebar_documents(api_base_url: str, reachable: bool) -> set[str]:
+    st.subheader("知识库选择")
 
     if not reachable:
         st.caption("后端不可访问，无法加载文档列表。")
-        return
+        return set()
 
-    refresh_clicked = st.button("刷新文档列表", key="refresh_documents")
+    refresh_clicked = st.button("刷新列表", key="refresh_documents")
 
-    documents: list[dict] = []
-    if refresh_clicked or "sidebar_documents" not in st.session_state:
-        try:
-            documents = fetch_documents(api_base_url)
-            st.session_state.sidebar_documents = documents
-        except requests.RequestException as exc:
-            st.error(_format_list_error(exc, "文档列表"))
-            documents = st.session_state.get("sidebar_documents", [])
+    try:
+        documents, active_kb_ids = _load_sidebar_catalog(api_base_url, refresh_clicked)
+    except requests.RequestException as exc:
+        st.error(_format_list_error(exc, "文档或知识库列表"))
+        return st.session_state.get("active_kb_ids", set())
+
+    available_docs = [doc for doc in documents if doc["knowledge_base_id"] in active_kb_ids]
+    expired_docs = [doc for doc in documents if doc["knowledge_base_id"] not in active_kb_ids]
+
+    st.caption(f"后端内存中可用：{len(active_kb_ids)} 个 · 数据库记录：{len(documents)} 条")
+
+    if available_docs:
+        current_kb = st.session_state.knowledge_base_id
+        option_indices = list(range(len(available_docs) + 1))
+
+        def _format_available_option(index: int) -> str:
+            if index == 0:
+                return "（未选择 — 请先选择或上传 PDF）"
+            doc = available_docs[index - 1]
+            return (
+                f"🟢 {doc['filename']} · {doc['chunks_count']} 块 · "
+                f"{doc['created_at'][:19]}"
+            )
+
+        default_index = 0
+        if _is_kb_active(current_kb, active_kb_ids):
+            for index, doc in enumerate(available_docs, start=1):
+                if doc["knowledge_base_id"] == current_kb:
+                    default_index = index
+                    break
+
+        selected_index = st.selectbox(
+            "可用知识库",
+            option_indices,
+            format_func=_format_available_option,
+            index=default_index,
+            key="sidebar_available_kb_select",
+        )
+
+        if selected_index == 0:
+            if _is_kb_active(st.session_state.knowledge_base_id, active_kb_ids):
+                _clear_knowledge_base_session()
+                st.rerun()
+        else:
+            selected_doc = available_docs[selected_index - 1]
+            selected_kb = selected_doc["knowledge_base_id"]
+            if selected_kb != st.session_state.knowledge_base_id:
+                _apply_document_to_session(selected_doc)
+                st.session_state.history = []
+                st.rerun()
     else:
-        documents = st.session_state.get("sidebar_documents", [])
+        st.warning("当前没有可问答的知识库。请上传 PDF 构建向量库。")
+        if _is_kb_active(st.session_state.knowledge_base_id, active_kb_ids):
+            _clear_knowledge_base_session()
+            st.rerun()
+
+    if expired_docs:
+        with st.expander(f"历史文档（{len(expired_docs)} 条，仅记录，需重新上传才可问答）"):
+            for doc in expired_docs:
+                st.markdown(
+                    f"⚠️ **{doc['filename']}** · {doc['chunks_count']} 块 · "
+                    f"`{doc['knowledge_base_id'][:8]}...`"
+                )
+                st.caption(f"上传于 {doc['created_at'][:19]} · 数据库 status: {doc.get('status', '-')}")
 
     if not documents:
-        st.caption("暂无已上传文档。")
-        return
+        st.caption("暂无已上传文档记录。")
 
-    kb_ids = [doc["knowledge_base_id"] for doc in documents]
-    labels = [
-        f"{doc['filename']} · {doc['chunks_count']} 块 · {doc['created_at'][:19]}"
-        for doc in documents
-    ]
-
-    current_kb = st.session_state.knowledge_base_id
-    default_index = kb_ids.index(current_kb) if current_kb in kb_ids else 0
-
-    selected_index = st.selectbox(
-        "选择知识库",
-        range(len(documents)),
-        format_func=lambda i: labels[i],
-        index=default_index,
-        key="sidebar_kb_select",
-    )
-    selected_doc = documents[selected_index]
-    selected_kb = selected_doc["knowledge_base_id"]
-
-    if selected_kb != st.session_state.knowledge_base_id:
-        _apply_document_to_session(selected_doc)
-        st.session_state.history = []
-        st.rerun()
-
-    st.caption(f"共 {len(documents)} 条最近文档")
+    return active_kb_ids
 
 
-def _render_chat_tab(api_base_url: str) -> None:
-    _render_knowledge_base_status()
+def _render_chat_tab(api_base_url: str, active_kb_ids: set[str]) -> None:
+    _render_knowledge_base_status(active_kb_ids)
     st.divider()
     st.subheader("对话")
 
-    has_knowledge_base = bool(st.session_state.knowledge_base_id)
-    can_chat = has_knowledge_base and st.session_state.backend_reachable
+    kb_id = st.session_state.knowledge_base_id
+    kb_active = _is_kb_active(kb_id, active_kb_ids)
+    has_knowledge_base = kb_active
+    can_chat = kb_active and st.session_state.backend_reachable
 
-    if not has_knowledge_base:
-        st.warning("请先上传 PDF 并构建知识库，或从侧边栏选择已有知识库后再提问。")
+    if not kb_id:
+        st.warning("请先上传 PDF 并构建知识库，或从侧边栏「可用知识库」中选择后再提问。")
+    elif not kb_active:
+        st.warning(
+            "当前选中的知识库不可问答。这通常是后端重启后向量索引已清空。"
+            "请重新上传 PDF，或选择一个 🟢 可用知识库。"
+        )
 
     for turn in st.session_state.history:
         normalized = _normalize_turn(turn)
@@ -411,8 +502,8 @@ def _render_chat_tab(api_base_url: str) -> None:
         "请输入你的问题...",
         disabled=not can_chat,
     ):
-        if not has_knowledge_base:
-            st.warning("请先上传 PDF 并构建知识库后再提问。")
+        if not kb_active:
+            st.warning("当前知识库不可用，请重新上传 PDF 或选择可用知识库后再提问。")
         elif not st.session_state.backend_reachable:
             st.error(st.session_state.backend_check_error or "后端不可访问，无法提问。")
         else:
@@ -437,11 +528,30 @@ def _render_chat_tab(api_base_url: str) -> None:
 def _render_qa_history_tab(api_base_url: str) -> None:
     st.subheader("历史问答")
 
-    if not st.session_state.knowledge_base_id:
-        st.info("请先在侧边栏选择或构建知识库，再查看历史问答。")
+    documents: list[dict] = st.session_state.get("sidebar_documents", [])
+    if not documents:
+        st.info("请先在侧边栏刷新列表，或上传 PDF 后再查看历史问答。")
         return
 
-    st.caption(f"知识库：`{st.session_state.knowledge_base_id}`")
+    doc_options = {doc["knowledge_base_id"]: doc for doc in documents}
+    kb_ids = list(doc_options.keys())
+
+    def _format_history_kb(kb: str) -> str:
+        doc = doc_options[kb]
+        return f"{doc['filename']} · {doc['chunks_count']} 块 · {kb[:8]}..."
+
+    default_kb = st.session_state.knowledge_base_id
+    default_index = kb_ids.index(default_kb) if default_kb in kb_ids else 0
+
+    selected_kb = st.selectbox(
+        "选择要查看的历史知识库",
+        kb_ids,
+        format_func=_format_history_kb,
+        index=default_index,
+        key="history_kb_select",
+    )
+
+    st.caption(f"知识库：`{selected_kb}`（历史记录来自 PostgreSQL，不要求当前可问答）")
 
     col_refresh, col_limit = st.columns([1, 2])
     with col_refresh:
@@ -460,7 +570,7 @@ def _render_qa_history_tab(api_base_url: str) -> None:
         st.session_state.pop("qa_logs_cache", None)
 
     qa_logs: list[dict] = []
-    cache_key = f"{st.session_state.knowledge_base_id}:{log_limit}"
+    cache_key = f"{selected_kb}:{log_limit}"
     if st.session_state.get("qa_logs_cache_key") == cache_key:
         qa_logs = st.session_state.get("qa_logs_cache", [])
     else:
@@ -468,7 +578,7 @@ def _render_qa_history_tab(api_base_url: str) -> None:
             try:
                 qa_logs = fetch_qa_logs(
                     api_base_url,
-                    st.session_state.knowledge_base_id,
+                    selected_kb,
                     limit=int(log_limit),
                 )
                 st.session_state.qa_logs_cache = qa_logs
@@ -524,7 +634,8 @@ def _render_debug_help_tab() -> None:
     st.code(
         "\n".join(
             [
-                "GET  /documents/                          # 最近上传文档",
+                "GET  /documents/                          # 最近上传文档（PostgreSQL）",
+                "GET  /knowledge_bases                     # 当前可问答的知识库（内存）",
                 "GET  /qa_logs/?knowledge_base_id=...      # 历史问答",
                 "POST /upload_pdf/                         # 上传 PDF",
                 "POST /ask/                                # Agent 问答（debug=true）",
@@ -569,7 +680,7 @@ with st.sidebar:
         st.error(error_message or "后端不可访问")
 
     st.divider()
-    _render_sidebar_documents(api_base_url, reachable)
+    active_kb_ids = _render_sidebar_documents(api_base_url, reachable)
 
     st.divider()
     st.subheader("知识库构建")
@@ -596,6 +707,7 @@ with st.sidebar:
                     st.session_state.upload_message = result.get("message")
                     st.session_state.history = []
                     st.session_state.pop("sidebar_documents", None)
+                    st.session_state.pop("active_kb_ids", None)
                     st.session_state.pop("qa_logs_cache", None)
                     st.session_state.pop("qa_logs_cache_key", None)
                     st.success("向量库构建成功")
@@ -606,7 +718,7 @@ with st.sidebar:
 tab_chat, tab_history, tab_debug = st.tabs(["聊天", "历史记录", "调试说明"])
 
 with tab_chat:
-    _render_chat_tab(api_base_url)
+    _render_chat_tab(api_base_url, active_kb_ids if reachable else set())
 
 with tab_history:
     _render_qa_history_tab(api_base_url)
